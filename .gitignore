@@ -1,0 +1,6 @@
+Longform/Secrets.swift
+.DS_Store
+xcuserdata/
+*.xcuserstate
+build/
+DerivedData/

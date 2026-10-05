@@ -1,0 +1,35 @@
+[
+  {
+    "id": "thinking-aloud",
+    "turn": "Um, we're having another test conversation, but I don't know. I guess I'm just seeing how this feels."
+  },
+  {
+    "id": "short-aside",
+    "turn": "Yeah okay. That makes sense."
+  },
+  {
+    "id": "simple-question",
+    "turn": "Are there any octopuses off Long Island in New York State?"
+  },
+  {
+    "id": "trails-off",
+    "turn": "I was going to say... actually, hang on. No, never mind, forget that one."
+  },
+  {
+    "id": "long-ramble-lands",
+    "turn": "So I've been going back and forth on the sync layer thing. Part of me thinks it's fine and I'm just annoyed by it, but every feature takes days longer than it should, and it's always the same two files. I think what I'm actually asking is whether that's a signal or whether I'm just tired of looking at it."
+  },
+  {
+    "id": "explicit-depth",
+    "turn": "Okay, I actually do want the full picture on this one. Walk me through how on-device speech recognition works in detail.",
+    "allow_long": true
+  },
+  {
+    "id": "correction",
+    "turn": "No, not that one. I meant the other thing I mentioned."
+  },
+  {
+    "id": "decision-point",
+    "turn": "Alright, I think I'm just going to rewrite it and stop agonising over it."
+  }
+]
