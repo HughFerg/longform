@@ -13,7 +13,7 @@ struct Message: Identifiable {
 }
 
 enum Status: Equatable {
-    case idle, listening, thinking, speaking
+    case idle, listening, thinking, searching, speaking
     case error(String)
 
     var label: String {
@@ -21,15 +21,31 @@ enum Status: Equatable {
         case .idle: "Idle"
         case .listening: "Listening"
         case .thinking: "Thinking"
+        case .searching: "Searching"
         case .speaking: "Speaking"
         case .error(let message): "Error: \(message)"
         }
     }
+
+    /// A turn is in flight: the mic must stay shut and the trigger must not re-fire.
+    var isBusy: Bool {
+        switch self {
+        case .thinking, .searching, .speaking: true
+        default: false
+        }
+    }
+
+    /// Anything that should outlast the screen's idle timer.
+    var isActive: Bool { self != .idle && !isError }
+
+    var isError: Bool { if case .error = self { true } else { false } }
 }
 
 @MainActor @Observable
 final class ChatModel {
-    var triggerPhrase = "send it"
+    var triggerPhrase = Preferences.triggerPhrase {
+        didSet { Preferences.triggerPhrase = triggerPhrase }
+    }
     var transcript = ""
     var messages: [Message] = []
     var status: Status = .idle
@@ -38,10 +54,40 @@ final class ChatModel {
     let transcriber = Transcriber()
     private let claude = ClaudeClient()
     private let speaker = Speaker()
-    let cost = CostTracker()
+    let neural = KokoroSpeaker(voice: Preferences.neuralVoice)
 
-    /// Surfaced in the UI so a compact voice doesn't silently sound terrible.
-    var usingBasicVoice: Bool { speaker.usingBasicVoice }
+    /// Text carried over from earlier listening sessions. The live transcript is appended to it,
+    /// so stopping to think — or being cut off entirely — never costs you what you already said.
+    private var retained = ""
+
+    /// Multiplier on the engine's natural pace, applied to whichever engine is speaking.
+    var speakingRate = Preferences.speakingRate {
+        didSet { Preferences.speakingRate = speakingRate }
+    }
+
+    /// Which engine speaks replies. Falls back to the system voice until the model is ready.
+    var engine: VoiceEngine = Preferences.engine {
+        didSet {
+            Preferences.engine = engine
+            guard engine == .neural else { return }
+            Task { await neural.prepare() }
+        }
+    }
+
+    /// Bindable passthrough so the picker can write to the engine's own property.
+    var neuralVoice: String {
+        get { neural.voice }
+        set {
+            neural.voice = newValue
+            Preferences.neuralVoice = newValue
+        }
+    }
+
+    private var voice: any VoiceOutput {
+        engine == .neural && neural.isReady ? neural : speaker
+    }
+    let cost = CostTracker()
+    let store = ConversationStore()
 
     /// Set when a turn ends, read when speech starts — the silence the user actually sits through.
     private var turnEnded: ContinuousClock.Instant?
@@ -50,52 +96,97 @@ final class ChatModel {
     var canSend: Bool { !transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
 
     init() {
+        retained = Preferences.draft
+        transcript = retained
         transcriber.onUpdate = { [weak self] text in self?.transcriptChanged(text) }
+        #if os(iOS)
+        AudioSession.observeRouteChanges()
+        #endif
     }
 
-    func checkSpeechAvailability() async {
-        speechAvailable = await Transcriber.isSupported
+    /// Warms the neural voice in the background. Nothing here gates the microphone: probing
+    /// model availability at launch could hang, and `start()` already reports its own failures.
+    func warmUp() {
+        Log.speech.notice("launched")
+        guard engine == .neural else { return }
+        Task { await neural.prepare() }
     }
 
-    /// Single entry point for transcript changes, from the mic or from typing.
-    /// Typing counts too, so the trigger works in the Simulator, which has no speech models.
-    func transcriptChanged(_ text: String) {
-        transcript = text
-        guard status != .thinking, status != .speaking,
-              let message = TriggerDetector.match(text, trigger: triggerPhrase),
+    /// Single entry point for transcript changes. The live text is appended to whatever was
+    /// retained from a previous session, so one turn can span several stretches of listening.
+    func transcriptChanged(_ live: String) {
+        let combined = [retained, live].filter { !$0.isEmpty }.joined(separator: " ")
+        transcript = combined
+        Preferences.draft = combined
+
+        guard !status.isBusy,
+              let message = TriggerDetector.match(combined, trigger: triggerPhrase),
               !message.isEmpty
         else { return }
 
         let phrase = triggerPhrase
-        Log.trigger.notice("matched \(phrase) in: \(text)")
+        Log.trigger.notice("matched \(phrase) in: \(combined)")
         status = .thinking  // set synchronously so later updates can't re-fire
         turnEnded = ContinuousClock().now
         Task { await send(message) }
     }
 
     /// Cuts off the spoken reply. `send` then falls through to resuming the mic as if it had finished.
-    func stopSpeaking() {
-        speaker.stop()
+    /// Reopens a past conversation. The whole history is sent on the next turn, so Claude
+    /// picks up with the same context it had.
+    func resume(_ conversation: StoredConversation) {
+        messages = store.resume(conversation)
+        discardDraft()
+        status = .idle
+        Log.api.notice("resumed \(self.messages.count) messages")
     }
 
+    func startNewConversation() {
+        store.startNew()
+        messages = []
+        discardDraft()
+        status = .idle
+    }
+
+    /// Throws away the part-finished turn. The only way to clear it without sending it.
+    func discardDraft() {
+        retained = ""
+        transcript = ""
+        Preferences.draft = ""
+    }
+
+    func stopSpeaking() {
+        voice.stop()
+    }
+
+    /// Serialises the mic transitions. Tapping the button faster than start/stop can complete
+    /// otherwise overlaps them, which crashes the audio engine.
+    private var isSwitching = false
+
     func toggleListening() async {
+        guard !isSwitching else { return }
+        isSwitching = true
+        defer { isSwitching = false }
+
         if isListening { await stopListening() } else { await startListening() }
     }
 
     func startListening() async {
-        guard speechAvailable, !isListening else { return }
-        transcript = ""
+        guard !isListening, !status.isBusy else { return }
+        retained = transcript  // the new session's words land after what's already there
         status = .listening
         do {
             try await transcriber.start()
         } catch {
             Log.speech.error("start failed: \(error.localizedDescription)")
+            if case TranscriberError.noModels = error { speechAvailable = false }
             status = .error(error.localizedDescription)
         }
     }
 
     func stopListening() async {
         await transcriber.stop()
+        retained = transcript
         status = .idle
     }
 
@@ -105,21 +196,29 @@ final class ChatModel {
         let text = (override ?? transcript).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
 
-        transcript = ""
+        discardDraft()
         messages.append(Message(role: .user, text: text))
+        store.save(messages)
         status = .thinking
 
         var splitter = SentenceSplitter()
         var reply = ""
-        speaker.reset()
+        let voice = self.voice
+        voice.rate = speakingRate
+        voice.reset()
 
         do {
             var usage = Usage()
             for try await event in claude.stream(messages) {
                 guard case .text(let delta) = event else {
-                    if case .usage(let tokens) = event {
+                    switch event {
+                    case .usage(let tokens):
                         usage.inputTokens += tokens.inputTokens
                         usage.outputTokens += tokens.outputTokens
+                        usage.searches += tokens.searches
+                    case .searching:
+                        if status == .thinking { status = .searching }
+                    case .text: break
                     }
                     continue
                 }
@@ -132,20 +231,21 @@ final class ChatModel {
                             self.turnEnded = nil
                         }
                     }
-                    speaker.enqueue(sentence)
+                    voice.enqueue(sentence)
                 }
             }
             if let rest = splitter.flush() {
                 if status != .speaking { status = .speaking }
-                speaker.enqueue(rest)
+                voice.enqueue(rest)
             }
 
             guard !reply.isEmpty else { throw ClaudeError.emptyReply }
             messages.append(Message(role: .assistant, text: reply))
+            store.save(messages)
             Log.api.notice("reply \(reply.count) chars (you \(text.count))")
             cost.record(usage)
 
-            await speaker.finish()
+            await voice.finish()
             status = .idle
             await startListening()
         } catch {

@@ -40,7 +40,15 @@ final class Transcriber {
         get async { await !SpeechTranscriber.supportedLocales.isEmpty }
     }
 
+    /// True between the first await in `start()` and the engine actually running. Rapid taps can
+    /// otherwise call start twice and install a second tap on the same bus, which traps.
+    private var isStarting = false
+
     func start() async throws {
+        guard analyzer == nil, !isStarting else { return }
+        isStarting = true
+        defer { isStarting = false }
+
         guard await AVAudioApplication.requestRecordPermission() else { throw TranscriberError.micDenied }
         guard await requestSpeechAuthorization() else { throw TranscriberError.speechDenied }
 
@@ -57,9 +65,7 @@ final class Transcriber {
         try await reserve(locale)
 
         #if os(iOS)
-        let session = AVAudioSession.sharedInstance()
-        try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker])
-        try session.setActive(true)
+        try AudioSession.activate()
         #endif
 
         let (stream, continuation) = AsyncStream<AnalyzerInput>.makeStream()
@@ -67,7 +73,12 @@ final class Transcriber {
 
         let analyzer = SpeechAnalyzer(modules: [transcriber])
         self.analyzer = analyzer
-        try await analyzer.start(inputSequence: stream)
+        do {
+            try await analyzer.start(inputSequence: stream)
+        } catch {
+            await tearDown()
+            throw error
+        }
 
         resultsTask = Task { [weak self] in
             do {
@@ -80,41 +91,58 @@ final class Transcriber {
         let inputFormat = engine.inputNode.outputFormat(forBus: 0)
         guard let analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]),
               let converter = AVAudioConverter(from: inputFormat, to: analyzerFormat)
-        else { throw TranscriberError.audioSetupFailed }
+        else {
+            await tearDown()
+            throw TranscriberError.audioSetupFailed
+        }
 
         nonisolated(unsafe) let tapConverter = converter
         // The iOS 27 throwing replacement for installTap has no Swift overlay yet; this call still works.
+        engine.inputNode.removeTap(onBus: 0)  // a failed previous start can leave one installed
         engine.inputNode.installTap(onBus: 0, bufferSize: 8192, format: inputFormat) { buffer, _ in
             guard let converted = Self.convert(buffer, using: tapConverter, to: analyzerFormat) else { return }
             continuation.yield(AnalyzerInput(buffer: converted))
         }
         engine.prepare()
-        try engine.start()
+        do {
+            try engine.start()
+        } catch {
+            await tearDown()
+            throw error
+        }
 
         Log.speech.notice("listening in \(locale.identifier) at \(Int(analyzerFormat.sampleRate))Hz")
     }
 
     func stop() async {
-        guard analyzer != nil else { return }
+        guard analyzer != nil, !isStarting else { return }
+        await tearDown()
+        Log.speech.notice("stopped after \(self.finalized.count) finalized chars")
+    }
+
+    /// Returns the transcriber to a startable state. State is cleared *before* any await, so a
+    /// hang in `finalizeAndFinishThroughEndOfInput` can't leave `analyzer` set and wedge every
+    /// future `start()` behind its guard.
+    private func tearDown() async {
+        let analyzer = self.analyzer
+        let locale = reservedLocale
+        self.analyzer = nil
+        self.reservedLocale = nil
 
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
         inputStream?.finish()
         inputStream = nil
-        try? await analyzer?.finalizeAndFinishThroughEndOfInput()
-        analyzer = nil
         resultsTask?.cancel()
         resultsTask = nil
 
-        if let reservedLocale {
-            await AssetInventory.release(reservedLocale: reservedLocale)
-            self.reservedLocale = nil
+        try? await analyzer?.finalizeAndFinishThroughEndOfInput()
+        if let locale {
+            await AssetInventory.release(reservedLocale: locale)
         }
         #if os(iOS)
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        AudioSession.deactivate()
         #endif
-
-        Log.speech.notice("stopped after \(self.finalized.count) finalized chars")
     }
 
     /// Final text below this is dropped as room noise.

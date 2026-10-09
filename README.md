@@ -67,15 +67,38 @@ The mic is off for the entire reply, so Claude's own speech can never trigger a 
 | `TriggerDetector.swift` | Pure functions: normalize, end-match, strip |
 | `ClaudeClient.swift` | Messages API over `URLSession` |
 | `Speaker.swift` | `AVSpeechSynthesizer` wrapped as `async` |
-| `Log.swift` | `OSLog` categories: `speech`, `trigger`, `api` |
+| `KokoroSpeaker.swift` | Kokoro neural TTS (FluidAudio) behind the same `VoiceOutput` protocol |
+| `ConversationStore.swift` | SwiftData persistence for past conversations |
+| `Preferences.swift` | Settings and the in-progress draft, in `UserDefaults` |
+| `ScreenLock.swift` | Holds off the idle timer while a turn is in flight |
+| `Log.swift` | `OSLog` categories: `speech`, `trigger`, `api`, `cost` |
 
 ### Turn lifecycle
 
-`Status` drives everything: `idle → listening → thinking → speaking → listening`.
+`Status` drives everything: `idle → listening → thinking → (searching) → speaking → listening`.
+`Status.isBusy` covers the three states where the mic must stay shut and the trigger must not re-fire.
 
 `ChatModel.transcriptChanged` is the single entry point for transcript updates, from the mic **or** from typing.
 It sets `status = .thinking` **synchronously** on a match — volatile results arrive fast enough that an
 `await`-gated guard would let a second update match the same text and send twice.
+
+### The draft survives everything
+
+A turn can run for minutes, so losing it is losing real thinking. Every transcript update writes to
+`Preferences.draft`, and `ChatModel` reloads it at launch. Stopping the mic doesn't clear it either:
+`retained` holds what's been said so far and each new listening session is appended to it, so one turn can
+span several stretches of listening, a backgrounded app, or a crash. It clears on send, or on **Clear**.
+
+### Web search
+
+`RequestBody` carries the server-side `web_search_20260209` tool, capped at 3 searches a turn. Anthropic runs
+the searches; results never reach the app, and only the final text is stored in history, so nothing
+compounds into the next turn. `content_block_start` for a `server_tool_use` block flips the UI to
+`.searching`.
+
+Searching is the expensive path: results land in the input context, so a searched turn measured ~39k input
+tokens (~8¢) against ~0.3¢ for a normal one, plus 1¢ per search. The prompt tells it to say "let me look"
+once and then stay quiet, because every narration line between searches gets spoken aloud.
 
 ### Why silence never ends a turn
 
@@ -213,25 +236,26 @@ Console (Settings ▸ Admin keys) if you want org-level reporting; the in-app nu
 
 ### TODO
 
-**Better voice (cloud TTS).** On-device `AVSpeechSynthesizer` tops out at Premium, a clear tier below what the
-Claude mobile app sounds like — that uses **ElevenLabs** (Anthropic lists it as a subcontractor; the five voices
-are Buttery, Airy, Mellow, Glassy, Rounded). Matching it means swapping `Speaker` for a streaming cloud TTS:
+**Turn-taking.** The prompt enforces brevity but can't tell a question that deserves depth from one that
+doesn't, and doesn't scale its reply to how long you spoke. Real conversational behaviour — matching your
+length, acknowledging rather than answering, knowing when you're thinking aloud — is the open problem.
+`evals/run_eval.py` is the measuring stick.
 
-- ElevenLabs Flash v2.5 (~75-150ms to first audio) or Cartesia Sonic, called over raw HTTP like `ClaudeClient`
-- Costs a second API key and per-character billing; adds a network dependency to every reply
-- `Speaker` is already the only thing that touches TTS, so the swap is one file
+**Ambient capture.** During a long pause the mic transcribes everything in the room, and it all lands in your
+message. The confidence filter only catches unclear audio, not a clear voice that isn't yours. A pause button
+or `SpeechDetector` gating is the real fix.
 
-**Stream the reply.** Today the full response is fetched before any audio plays, so there's a 2-4s silence after
-the trigger fires. Streaming the Messages API and speaking after the first sentence would cut most of that —
-likely a bigger felt improvement than voice timbre, and free. Note Claude's own voice mode is *full-duplex*
-(it decides when you've stopped talking), which is exactly the behaviour this app exists to avoid — take its
-TTS, not its turn-taking.
+**Bluetooth audio quality.** With `.playAndRecord` iOS may hold AirPods in HFP (narrowband) while the mic is
+live, which makes speech output sound muffled. Fixable by tearing the recording session down while speaking,
+at the cost of a slower resume.
+
+**Prompt caching.** The whole conversation is resent each turn, so input tokens grow while output stays flat.
+Caching the prefix would cut it tenfold. Only matters once sessions get long.
+
+**Cost counter.** Conversations persist; the session cost counter still resets with the app.
 
 ### Known limitations
 
-- `claude-sonnet-5-5` has thinking on by default, which adds latency before each spoken reply.
-  Adding `let thinking = ["type": "between_tools"]` (plus a `CodingKeys` case) to `RequestBody`
-  turns it off.
 - `Speaker.speak` must be called sequentially; a second call before the first returns would strand
   its continuation.
 - A `.error` status persists until the next successful action.

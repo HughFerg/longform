@@ -3,16 +3,13 @@ import OSLog
 
 /// Speaks a reply and returns only when it has finished, so the caller can resume the mic safely.
 @MainActor
-final class Speaker: NSObject {
+final class Speaker: NSObject, VoiceOutput {
     private let synthesizer = AVSpeechSynthesizer()
+    var rate = 1.0
     private var drained: CheckedContinuation<Void, Never>?
     private var queued = 0
     private var inputFinished = false
     private var cancelled = false
-
-    /// True when only a compact voice is installed — the robotic, "voicemail" sound.
-    /// Premium voices are a one-time user download in Settings; the app can't install them.
-    var usingBasicVoice: Bool { (voice?.quality ?? .default) == .default }
 
     private lazy var voice: AVSpeechSynthesisVoice? = {
         let chosen = Self.bestVoice()
@@ -47,16 +44,11 @@ final class Speaker: NSObject {
     func enqueue(_ text: String) {
         guard !cancelled else { return }
 
-        #if os(iOS)
-        let session = AVAudioSession.sharedInstance()
-        try? session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker])
-        try? session.setActive(true)
-        #endif
-
         queued += 1
         let utterance = AVSpeechUtterance(string: text)
         utterance.voice = voice
-        utterance.rate = AVSpeechUtteranceDefaultSpeechRate * 0.95  // a touch slower reads as less clipped
+        // a touch under default reads as less clipped; the user's rate scales from there
+        utterance.rate = AVSpeechUtteranceDefaultSpeechRate * 0.95 * Float(rate)
         synthesizer.speak(utterance)
     }
 
@@ -77,8 +69,12 @@ final class Speaker: NSObject {
         drained = nil
     }
 
-    /// Readies the speaker for the next reply.
+    /// Readies the speaker for the next reply. Activating here rather than per sentence
+    /// avoids reconfiguring the route mid-reply.
     func reset() {
+        #if os(iOS)
+        try? AudioSession.activate()
+        #endif
         cancelled = false
         inputFinished = false
         queued = 0
